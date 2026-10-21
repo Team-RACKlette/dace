@@ -88,6 +88,13 @@ class MapFusionHorizontal(transformation.SingleStateTransformation):
         category="Parameters",
         desc="If `True`, always create a new connector, instead of reusing one that referring to the same data.",
     )
+    ordering_edges_into_sources = properties.Property(
+        dtype=bool,
+        default=False,
+        category="Applicability",
+        desc="Also fuse Maps that `StateFusionExtended` ordered with an empty Memlet ending on a source node "
+        "of the second Map (see `find_happens_before_connection()`).",
+    )
     consolidate_edges_only_if_not_extending = properties.Property(
         dtype=bool,
         default=False,
@@ -236,6 +243,7 @@ class MapFusionHorizontal(transformation.SingleStateTransformation):
                     first_map_entry=first_map_entry,
                     second_map_entry=second_map_entry,
                     param_repl=param_repl,
+                    into_sources=self.ordering_edges_into_sources,
                 )
                 is not None
             )
@@ -281,6 +289,7 @@ class MapFusionHorizontal(transformation.SingleStateTransformation):
                 first_map_entry=first_map_entry,
                 second_map_entry=second_map_entry,
                 param_repl=mfhelper.find_parameter_remapping(first_map_entry.map, second_map_entry.map),
+                into_sources=self.ordering_edges_into_sources,
             )
             assert plan is not None, "The Maps are neither parallel nor safely ordered."
             ordering_edges, inner_ordering_pairs = plan

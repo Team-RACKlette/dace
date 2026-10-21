@@ -9,7 +9,7 @@ import pytest
 
 import dace
 from dace.sdfg import nodes
-from dace.sdfg.state import ConditionalBlock, ControlFlowRegion, LoopRegion
+from dace.sdfg.state import BreakBlock, ConditionalBlock, ControlFlowRegion, LoopRegion
 from dace.transformation.interstate import LoopToMap, StateFusion
 from dace.transformation.interstate.loop_lifting import LoopLifting
 
@@ -1419,3 +1419,87 @@ def test_conditional_body_does_not_crash_the_match():
     sdfg(A=A)
     expected = np.array([(i + 1) if i % 2 == 0 else (i + 2) for i in range(20)], dtype=np.float64)
     assert np.allclose(A, expected)
+
+
+def inner_break_sdfg(own_break: bool) -> dace.SDFG:
+    """``B[i] = A[i]``, then an inner loop doubles ``B[i]`` and breaks once ``j >= i % 5``: ``B[i] = A[i] * 2**(i % 5 + 1)``
+    (a Newton iteration's exit, say). ``own_break``: a break of the outer loop itself instead."""
+    sdfg = dace.SDFG("inner_break" + ("_own" if own_break else ""))
+    sdfg.add_array("A", [20], dace.float64)
+    sdfg.add_array("B", [20], dace.float64)
+    outer = LoopRegion("outer", "i < 20", "i", "i = 0", "i = i + 1")
+    sdfg.add_node(outer, is_start_block=True)
+    init = outer.add_state("init", is_start_block=True)
+    t = init.add_tasklet("copy", {"a"}, {"b"}, "b = a")
+    init.add_edge(init.add_read("A"), None, t, "a", dace.Memlet("A[i]"))
+    init.add_edge(t, "b", init.add_write("B"), None, dace.Memlet("B[i]"))
+    inner = LoopRegion("inner", "j < 10", "j", "j = 0", "j = j + 1")
+    outer.add_node(inner)
+    outer.add_edge(init, inner, dace.InterstateEdge())
+    double = inner.add_state("double", is_start_block=True)
+    t = double.add_tasklet("twice", {"x"}, {"y"}, "y = 2 * x")
+    double.add_edge(double.add_read("B"), None, t, "x", dace.Memlet("B[i]"))
+    double.add_edge(t, "y", double.add_write("B"), None, dace.Memlet("B[i]"))
+    stop = ConditionalBlock("stop")
+    region = outer if own_break else inner
+    region.add_node(stop)
+    region.add_edge(inner if own_break else double, stop, dace.InterstateEdge())
+    leave = ControlFlowRegion("leave", sdfg=sdfg)
+    leave.add_node(BreakBlock("leave_loop"), is_start_block=True)
+    stop.add_branch(dace.properties.CodeBlock("i >= 10" if own_break else "j >= i % 5"), leave)
+    sdfg.validate()
+    return sdfg
+
+
+def test_a_break_of_an_inner_loop_does_not_keep_the_outer_loop():
+    sdfg = inner_break_sdfg(own_break=False)
+    outer = next(r for r in sdfg.all_control_flow_regions() if isinstance(r, LoopRegion) and r.label == "outer")
+    assert LoopToMap.can_be_applied_to(sdfg, loop=outer)
+    LoopToMap.apply_to(sdfg, loop=outer)
+    assert [r.label for r in sdfg.all_control_flow_regions(recursive=True) if isinstance(r, LoopRegion)] == ["inner"]
+    A = np.linspace(1.0, 2.0, 20).copy()  # linspace returns a view, which DaCe does not take
+    B = np.zeros(20)
+    sdfg(A=A, B=B)
+    assert np.allclose(B, A * 2.0**(np.arange(20) % 5 + 1))
+
+
+def test_a_break_of_the_loop_itself_keeps_it_a_loop():
+    sdfg = inner_break_sdfg(own_break=True)
+    outer = next(r for r in sdfg.all_control_flow_regions() if isinstance(r, LoopRegion) and r.label == "outer")
+    assert not LoopToMap.can_be_applied_to(sdfg, loop=outer)
+
+
+def branch_assigned_symbol_sdfg() -> dace.SDFG:
+    """``s`` is assigned on both branches of a conditional, and the conditional's out-edge reads it
+    (``t = 2 * s``): ``A[i] = 2 * (i + 1)`` for even ``i``, ``2 * (i + 2)`` for odd (an inlined function's result
+    chosen by a flag, then used)."""
+    sdfg = dace.SDFG("branch_assigned_symbol")
+    sdfg.add_array("A", [20], dace.float64)
+    sdfg.add_symbol("s", dace.int64)
+    sdfg.add_symbol("t", dace.int64)
+    loop = LoopRegion("loop", "i < 20", "i", "i = 0", "i = i + 1")
+    sdfg.add_node(loop, is_start_block=True)
+    cond = ConditionalBlock("pick")
+    loop.add_node(cond, is_start_block=True)
+    for label, expr, condition in (("then", "i + 1", "i % 2 == 0"), ("else", "i + 2", None)):
+        region = ControlFlowRegion(f"{label}_body", sdfg=sdfg)
+        first = region.add_state(f"{label}_first", is_start_block=True)
+        last = region.add_state(f"{label}_last")
+        region.add_edge(first, last, dace.InterstateEdge(assignments={"s": expr}))
+        cond.add_branch(dace.properties.CodeBlock(condition) if condition else None, region)
+    write = loop.add_state("write")
+    loop.add_edge(cond, write, dace.InterstateEdge(assignments={"t": "2 * s"}))
+    t = write.add_tasklet("put", {}, {"o"}, "o = t")
+    write.add_edge(t, "o", write.add_write("A"), None, dace.Memlet("A[i]"))
+    sdfg.validate()
+    return sdfg
+
+
+def test_a_symbol_assigned_on_every_branch_and_read_after_the_conditional():
+    sdfg = branch_assigned_symbol_sdfg()
+    loop = next(r for r in sdfg.all_control_flow_regions() if isinstance(r, LoopRegion))
+    assert LoopToMap.can_be_applied_to(sdfg, loop=loop)
+    LoopToMap.apply_to(sdfg, loop=loop)
+    A = np.zeros(20)
+    sdfg(A=A)
+    assert np.allclose(A, [2 * (i + 1) if i % 2 == 0 else 2 * (i + 2) for i in range(20)])

@@ -31,6 +31,23 @@ def _free_symbols_cached(value: Any) -> FrozenSet[str]:
     return frozenset(symbolic.free_symbols_and_functions(value))
 
 
+def _mapping_for_edge(mapping: Dict[str, Any], edge: InterstateEdge) -> Dict[str, Any]:
+    """``mapping`` without the values that may not enter the assignments of ``edge``: a value reading a symbol the
+    edge reassigns, put into the right-hand side of another of the edge's assignments, would read that assignment's
+    target (the assignments of one edge have no order). Such a symbol keeps its own assignment."""
+    keys = edge.assignments.keys()
+    if not keys:
+        return mapping
+    kept = {}
+    for name, value in mapping.items():
+        reassigned = _free_symbols(value) & keys
+        readers = {k for k, rhs in edge.assignments.items() if name in _free_symbols(rhs)}
+        if reassigned and any(reassigned - {k} for k in readers):
+            continue
+        kept[name] = value
+    return kept
+
+
 def _free_symbols(value: Any) -> FrozenSet[str]:
     """Memoized ``symbolic.free_symbols_and_functions``, as the same values are queried on every block."""
     if isinstance(value, (str, sympy.Basic)):
@@ -184,7 +201,9 @@ class ConstantPropagation(ppl.Pass):
                 if out_mapping:
                     # Replace in outgoing edges as well
                     for e in block.parent_graph.out_edges(block):
-                        e.data.replace_dict(out_mapping, replace_keys=False)
+                        edge_mapping = _mapping_for_edge(out_mapping, e.data)
+                        remaining_unknowns.update(set(out_mapping) - set(edge_mapping))
+                        e.data.replace_dict(edge_mapping, replace_keys=False)
 
                 if isinstance(block, LoopRegion):
                     self._propagate_loop(block, post_constants, multivalue_desc_symbols)
@@ -448,13 +467,14 @@ class ConstantPropagation(ppl.Pass):
                         continue
                     edge_value_symbols = {k: _free_symbols(v) for k, v in edge.data.assignments.items()}
                     for aname, aval in assignments.items():
-                        # If the specific replacement would result in the value being both used and reassigned on the
-                        # same inter-state edge, remove it from consideration.
+                        # If the specific replacement would put a symbol this edge reassigns into the right-hand side
+                        # of another of its assignments (an assignment may read only its own target among them),
+                        # remove it from consideration.
                         reassignments = _free_symbols(aval) & edge.data.assignments.keys()
                         if not reassignments:
                             continue
                         used_in_assignments = {k for k, fsyms in edge_value_symbols.items() if aname in fsyms}
-                        if used_in_assignments - reassignments:
+                        if any(reassignments - {k} for k in used_in_assignments):
                             assignments[aname] = _UnknownValue
 
                 if isinstance(block, LoopRegion):

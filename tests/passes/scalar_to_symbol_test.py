@@ -178,6 +178,38 @@ def test_promote_copy():
     assert np.allclose(A, expected)
 
 
+def test_promote_through_ordering_edge():
+    """A scalar read that an empty memlet orders after an array write is still a read, not a copy of the array."""
+    sdfg = dace.SDFG("testprog_ordering")
+    sdfg.add_array("A", [10], dace.float64)
+    sdfg.add_array("B", [10], dace.float64)
+    sdfg.add_transient("s", [1], dace.int32)
+    state = sdfg.add_state()
+    state.add_edge(
+        state.add_tasklet("sets", {}, {"out"}, "out = 5"), "out", state.add_write("s"), None, dace.Memlet("s")
+    )
+    state = sdfg.add_state_after(state)
+    a = state.add_write("A")
+    state.add_edge(state.add_tasklet("seta", {}, {"out"}, "out = 1.0"), "out", a, None, dace.Memlet("A[0]"))
+    s_read = state.add_read("s")
+    state.add_nedge(a, s_read, dace.Memlet())  # read s only after A[0] is written
+    t = state.add_tasklet("useb", {"inp"}, {"out"}, "out = inp + 1")
+    state.add_edge(s_read, None, t, "inp", dace.Memlet("s"))
+    state.add_edge(t, "out", state.add_write("B"), None, dace.Memlet("B[0]"))
+
+    assert scalar_to_symbol.find_promotable_scalars(sdfg) == {"s"}
+    scalar_to_symbol.ScalarToSymbolPromotion().apply_pass(sdfg, {})
+    sdfg.validate()
+    for edge in sdfg.all_interstate_edges():
+        assert edge.data.assignments.get("s", "5") == "5"
+    # The order of the write and the read it once protected survives through the reader
+    assert state.edges_between(a, t)
+
+    A, B = np.zeros(10), np.zeros(10)
+    sdfg(A=A, B=B)
+    assert A[0] == 1.0 and B[0] == 6.0
+
+
 def test_promote_array_assignment():
     """Simple promotion with array assignment."""
 
@@ -888,6 +920,7 @@ if __name__ == "__main__":
     test_promote_simple_c()
     test_promote_disconnect()
     test_promote_copy()
+    test_promote_through_ordering_edge()
     test_promote_array_assignment()
     test_promote_array_assignment_tasklet()
     test_promote_loop()
@@ -916,3 +949,37 @@ if __name__ == "__main__":
     test_do_not_promote_lossy_cast("out = dace.int64(inp + 1) - i", dace.int32)
     test_do_not_promote_lossy_cast("out = dace.int64(i) * dace.int64(inp)", dace.int32)
     test_promote_widened_loop_index()
+
+
+def test_promoted_scalar_read_through_an_ordered_node_of_a_nested_sdfg():
+    """A nested SDFG reads the promoted scalar through a node an empty memlet orders after another one: once the read
+    is the symbol, that node goes too, since the scalar's descriptor does."""
+    sdfg = dace.SDFG("promote_ordered_read")
+    sdfg.add_scalar("s", dace.int32, transient=True)
+    sdfg.add_array("x", [4], dace.float64)
+    sdfg.add_array("out", [4], dace.float64)
+    first = sdfg.add_state("set")
+    tasklet = first.add_tasklet("set_s", {}, {"o"}, "o = 3")
+    first.add_edge(tasklet, "o", first.add_write("s"), None, dace.Memlet("s[0]"))
+    second = sdfg.add_state_after(first, "use")
+    inner = dace.SDFG("inner")
+    inner.add_scalar("s", dace.int32)
+    inner.add_array("x", [4], dace.float64)
+    inner.add_array("out", [4], dace.float64)
+    body = inner.add_state("body")
+    x_node, s_node = body.add_read("x"), body.add_read("s")
+    body.add_nedge(x_node, s_node, dace.Memlet())
+    scale = body.add_tasklet("scale", {"a", "k"}, {"o"}, "o = a * k")
+    body.add_edge(x_node, None, scale, "a", dace.Memlet("x[0]"))
+    body.add_edge(s_node, None, scale, "k", dace.Memlet("s[0]"))
+    body.add_edge(scale, "o", body.add_write("out"), None, dace.Memlet("out[0]"))
+    nested = second.add_nested_sdfg(inner, {"s", "x"}, {"out"})
+    second.add_edge(second.add_read("s"), None, nested, "s", dace.Memlet("s[0]"))
+    second.add_edge(second.add_read("x"), None, nested, "x", dace.Memlet("x[0:4]"))
+    second.add_edge(nested, "out", second.add_write("out"), None, dace.Memlet("out[0:4]"))
+    sdfg.validate()
+    assert "s" in scalar_to_symbol.ScalarToSymbolPromotion().apply_pass(sdfg, {})
+    sdfg.validate()
+    x, out = np.arange(1, 5, dtype=np.float64), np.zeros(4)
+    sdfg(x=x, out=out)
+    assert out[0] == 3 * x[0]

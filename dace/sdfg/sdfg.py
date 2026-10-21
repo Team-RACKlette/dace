@@ -3287,8 +3287,16 @@ class SDFG(ControlFlowRegion):
         # Avoiding import loops
         from dace.transformation.interstate import GPUTransformSDFG
 
-        self.apply_transformations(
-            GPUTransformSDFG,
+        # This SDFG and no other: a pattern match would also try the nested SDFGs, and when this SDFG cannot take
+        # the transformation it would land on a nested one -- the body of a map, say, which is then "transformed"
+        # as if it were a program of its own.
+        transformation = GPUTransformSDFG()
+        transformation.setup_match(
+            self,
+            self.cfg_id,
+            -1,
+            {},
+            0,
             options=dict(
                 sequential_innermaps=sequential_innermaps,
                 register_trans=register_transients,
@@ -3296,11 +3304,12 @@ class SDFG(ControlFlowRegion):
                 host_maps=host_maps,
                 host_data=host_data,
             ),
-            validate=validate,
-            validate_all=validate_all,
-            permissive=permissive,
-            states=states,
         )
+        if not transformation.can_be_applied(self, 0, self, permissive=permissive):
+            raise ValueError(f"GPUTransformSDFG cannot be applied to SDFG {self.label}")
+        transformation.apply(self, self)
+        if validate_all or validate:
+            self.validate()
 
     def expand_library_nodes(self, recursive=True):
         """

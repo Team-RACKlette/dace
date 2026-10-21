@@ -239,3 +239,19 @@ if __name__ == "__main__":
         test_elementwise_symbolic(symbol_param)
     test_elementwise_with_floor_div()
     test_memlet_tree()
+
+
+def test_instrumentation_moves_to_the_kernel_map():
+    """A kernel map's instrumentation times the kernel: after the transformation it sits on the new kernel map, not
+    on the map that became the thread-block map (the code generator emits no timing for that one)."""
+    sdfg = elementwise_constexpr_size.to_sdfg()
+    kernel = next(n for n, _ in sdfg.all_nodes_recursive()
+                  if isinstance(n, dace.nodes.MapEntry) and n.schedule == dace.ScheduleType.GPU_Device)
+    kernel.map.instrument = dace.InstrumentationType.GPU_Events
+    assert sdfg.apply_transformations_once_everywhere(AddThreadBlockMap) == 1
+    entries = [n for n, _ in sdfg.all_nodes_recursive() if isinstance(n, dace.nodes.MapEntry)]
+    kernels = [n for n in entries if n.schedule == dace.ScheduleType.GPU_Device]
+    blocks = [n for n in entries if n.schedule == dace.ScheduleType.GPU_ThreadBlock]
+    assert len(kernels) == 1 and len(blocks) == 1
+    assert kernels[0].map.instrument == dace.InstrumentationType.GPU_Events
+    assert blocks[0].map.instrument == dace.InstrumentationType.No_Instrumentation

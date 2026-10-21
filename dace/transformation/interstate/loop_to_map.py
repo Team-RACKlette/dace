@@ -22,6 +22,14 @@ from ordered_set import OrderedSet
 IndexExpr = Union[str, int, symbolic.SymbolicType]
 
 
+def _enclosing_loop(block) -> Optional[LoopRegion]:
+    """The innermost loop region that holds ``block``."""
+    region = block.parent_graph
+    while region is not None and not isinstance(region, LoopRegion):
+        region = region.parent_graph
+    return region
+
+
 def _check_range(subset: subsets.Subset, a: IndexExpr, itersym: symbolic.symbol, b: IndexExpr, step: IndexExpr) -> bool:
     found = False
     for rb, re, _ in subset.ndrange():
@@ -298,30 +306,6 @@ def _writes_may_overlap(
     return True
 
 
-def symbols_assigned_before_use(loop: LoopRegion, itervar: str) -> Optional[Set[str]]:
-    """The symbols ``loop``'s body assigns, plus ``itervar``; ``None`` if an iteration reads one before assigning it."""
-    symbols_that_may_be_used: Set[str] = {itervar}
-    used_before_assignment: Set[str] = set()
-    # Blocks are visited in order, so a symbol not yet assigned in this iteration comes from the previous one.
-    for block in cfg_analysis.blockorder_topological_sort(loop, recursive=True, ignore_nonstate_blocks=False):
-        # ``read_symbols()`` sees only interstate-edge reads; a read in the block's dataflow (``b[im]``) counts too.
-        used_before_assignment |= {str(s) for s in block.free_symbols} - symbols_that_may_be_used
-        for e in block.parent_graph.out_edges(block):
-            used_before_assignment |= e.data.read_symbols() - symbols_that_may_be_used
-            assigned_symbols = set()
-            for k, v in e.data.assignments.items():
-                try:
-                    fsyms = symbolic.pystr_to_symbolic(v).free_symbols
-                except AttributeError:
-                    fsyms = set()
-                if k not in fsyms:
-                    assigned_symbols.add(k)
-            if assigned_symbols & used_before_assignment:
-                return None
-            symbols_that_may_be_used |= e.data.assignments.keys()
-    return symbols_that_may_be_used
-
-
 @properties.make_properties
 @xf.explicit_cf_compatible
 class LoopToMap(xf.MultiStateTransformation):
@@ -353,9 +337,12 @@ class LoopToMap(xf.MultiStateTransformation):
         if not t in dtypes.INTEGER_TYPES:
             return False
 
-        # Loops containing break, continue, or returns may not be turned into a map.
+        # Loops containing returns, or a break or continue of their own, may not be turned into a map. A break or
+        # continue of an inner loop leaves only that loop.
         for blk in self.loop.all_control_flow_blocks():
-            if isinstance(blk, (BreakBlock, ContinueBlock, ReturnBlock)):
+            if isinstance(blk, ReturnBlock):
+                return False
+            if isinstance(blk, (BreakBlock, ContinueBlock)) and _enclosing_loop(blk) is self.loop:
                 return False
 
         # We cannot handle symbols read from data containers unless they are scalar.
@@ -438,9 +425,9 @@ class LoopToMap(xf.MultiStateTransformation):
                         return False
 
                     symbols_that_may_be_used |= e.data.assignments.keys()
-        symbols_that_may_be_used |= symbols_assigned_before_use(self.loop, itervar)
-        if symbols_that_may_be_used is None:
-            return False
+        # The walk above refused every symbol an iteration reads before assigning it (a conditional assigning it on
+        # every branch counts as assigning it): every symbol the body assigns is local to an iteration.
+        symbols_that_may_be_used |= {k for e in self.loop.all_interstate_edges() for k in e.data.assignments}
 
         # Get access nodes from other states to isolate local loop variables
         other_access_nodes: Set[str] = set()

@@ -203,6 +203,10 @@ class AddThreadBlockMap(transformation.SingleStateTransformation):
         new_kernel_entry.map.allow_chiplet_threadblock_distribution = (
             kernel_map_entry.map.allow_chiplet_threadblock_distribution
         )
+        # Instrumentation times the kernel: it moves to the new kernel map (the code generator emits none for a
+        # thread-block map, so it would be lost on the map that became one).
+        new_kernel_entry.map.instrument = kernel_map_entry.map.instrument
+        kernel_map_entry.map.instrument = dtypes.InstrumentationType.No_Instrumentation
 
     def preprocess_default_dims(self):
         """

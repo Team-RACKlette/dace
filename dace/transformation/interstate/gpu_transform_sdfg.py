@@ -180,37 +180,99 @@ class GPUTransformSDFG(transformation.MultiStateTransformation):
         for state in sdfg.states():
             schildren = state.scope_children()
             for node in schildren[None]:
-                # If two top-level tasklets are connected with a code->code
-                # memlet, they will transform into an invalid SDFG
+                # If two top-level tasklets are connected with a code->code memlet, they will transform into an
+                # invalid SDFG. An empty memlet only orders the two; the kernel wrapping passes it through.
                 if isinstance(node, nodes.CodeNode) and any(
-                    isinstance(e.dst, nodes.CodeNode) for e in state.out_edges(node)
+                    isinstance(e.dst, nodes.CodeNode) and not e.data.is_empty() for e in state.out_edges(node)
                 ):
                     return False
         return True
 
-    def _get_marked_inputs_and_outputs(self, state, entry_node) -> list:
-        if not self.host_data and not self.host_maps:
+    def _get_marked_inputs_and_outputs(self, state, entry_node, marked_only: bool = True) -> list:
+        """The data ``entry_node``'s scope reads or writes that is host data (all of it if not ``marked_only``)."""
+        if marked_only and not self.host_data and not self.host_maps:
             return []
         marked_sources = [state.memlet_tree(e).root().edge.src for e in state.in_edges(entry_node)]
         marked_sources = [
             sdutil.get_view_node(state, node) if isinstance(node, data.View) else node for node in marked_sources
         ]
-        marked_destinations = [
-            state.memlet_tree(e).root().edge.dst for e in state.in_edges(state.exit_node(entry_node))
-        ]
+        # A map's results leave through its exit node; a library node's through its own out edges.
+        if isinstance(entry_node, nodes.EntryNode):
+            results = state.in_edges(state.exit_node(entry_node))
+        else:
+            results = state.out_edges(entry_node)
+        marked_destinations = [state.memlet_tree(e).root().edge.dst for e in results]
         marked_destinations = [
             sdutil.get_view_node(state, node) if isinstance(node, data.View) else node for node in marked_destinations
         ]
         marked_accesses = [
             n.data
             for n in (marked_sources + marked_destinations)
-            if n is not None and isinstance(n, nodes.AccessNode) and n.data in self.host_data
+            if n is not None and isinstance(n, nodes.AccessNode) and (n.data in self.host_data or not marked_only)
         ]
         return marked_accesses
 
     def _output_or_input_is_marked_host(self, state, entry_node) -> bool:
         marked_accesses = self._get_marked_inputs_and_outputs(state, entry_node)
         return len(marked_accesses) > 0
+
+    def _is_host_only_tasklet(self, state, node, device_data=()) -> bool:
+        """Whether ``node`` is a free tasklet whose data all stays on the host: every container it reads or
+        writes is host data in host storage, none of it in ``device_data``. Such a tasklet has nothing to do on
+        the device."""
+        if not self.host_data or not isinstance(node, nodes.Tasklet) or state.entry_node(node) is not None:
+            return False
+        sdfg = state.parent
+        ends = [state.memlet_tree(e).root().edge.src for e in state.in_edges(node) if not e.data.is_empty()]
+        ends += [state.memlet_tree(e).root().edge.dst for e in state.out_edges(node) if not e.data.is_empty()]
+        if not ends:
+            return False
+        return all(
+            isinstance(n, nodes.AccessNode)
+            and n.data in self.host_data
+            and n.data not in device_data
+            and sdfg.arrays[n.data].storage not in gpu_storage
+            for n in ends
+        )
+
+    def _on_host(self, state, node, device_data) -> bool:
+        """Whether ``node``, next to a top-level access node of host data, stays on the host: another access
+        node (a copy), a top-level map of ``host_maps``, a top-level library node (host data keeps it on the
+        host), or a free tasklet whose data all stays there."""
+        if isinstance(node, nodes.AccessNode):
+            return True
+        entry = state.entry_node(node) if isinstance(node, nodes.ExitNode) else node
+        scope = state.scope_dict()
+        if entry is None or scope[entry] is not None:
+            return False
+        if isinstance(entry, nodes.EntryNode):
+            return entry.guid in self.host_maps
+        if isinstance(entry, nodes.LibraryNode):
+            return True
+        return self._is_host_only_tasklet(state, entry, device_data)
+
+    def _device_host_data(self, sdfg) -> Set[str]:
+        """The non-transient host data that a node on the device may read or write: it needs a device copy.
+        A tasklet that touches one of them runs on the device, so the rest of its data does too."""
+        accesses = []
+        for state in sdfg.states():
+            scope = state.scope_dict()
+            for node in state.data_nodes():
+                if node.data in self.host_data and not node.desc(sdfg).transient:
+                    accesses.append((state, node, scope[node] is None))
+        device_data: Set[str] = set()
+        changed = True
+        while changed:
+            changed = False
+            for state, node, toplevel in accesses:
+                if node.data in device_data:
+                    continue
+                adjacent = [e.dst for e in state.out_edges(node) if not e.data.is_empty()]
+                adjacent += [e.src for e in state.in_edges(node) if not e.data.is_empty()]
+                if not toplevel or not all(self._on_host(state, n, device_data) for n in adjacent):
+                    device_data.add(node.data)
+                    changed = True
+        return device_data
 
     def apply(self, _, sdfg: sd.SDFG):
         #######################################################
@@ -232,14 +294,19 @@ class GPUTransformSDFG(transformation.MultiStateTransformation):
         for state in sdfg.states():
             for node in state.nodes():
                 if isinstance(node, nodes.EntryNode) and node.guid in self.host_maps:
-                    accesses = self._get_marked_inputs_and_outputs(state, node)
-                    self.host_data.extend(accesses)
+                    accesses = self._get_marked_inputs_and_outputs(state, node, marked_only=False)
+                    self.host_data.extend(a for a in accesses if a not in self.host_data)
+
+        # Host data that no node on the device reads or writes is not copied to the device: the clone would
+        # replace every access to it, those on the host included.
+        device_data = self._device_host_data(sdfg)
+        host_only = set(self.host_data) - device_data
 
         for state in sdfg.states():
             sdict = state.scope_dict()
             for node in state.nodes():
                 if isinstance(node, nodes.AccessNode) and node.desc(sdfg).transient == False:
-                    if state.out_degree(node) > 0 and node.data not in input_nodes:
+                    if state.out_degree(node) > 0 and node.data not in input_nodes and node.data not in host_only:
                         # Special case: nodes that lead to top-level dynamic
                         # map ranges must stay on host
                         for e in state.out_edges(node):
@@ -260,7 +327,7 @@ class GPUTransformSDFG(transformation.MultiStateTransformation):
 
             # Input nodes may also be nodes with WCR memlets and no identity
             for e in state.edges():
-                if e.data.wcr is not None:
+                if e.data.wcr is not None and e.data.data not in host_only:
                     if e.data.data not in input_nodes and sdfg.arrays[e.data.data].transient == False:
                         input_nodes.append((e.data.data, sdfg.arrays[e.data.data]))
 
@@ -399,6 +466,10 @@ class GPUTransformSDFG(transformation.MultiStateTransformation):
                             node.schedule = dtypes.ScheduleType.GPU_Device
                             gpu_nodes.add((state, node))
                 elif self.sequential_innermaps:
+                    # An inner map scheduled on the thread block already (an explicit tiling into shared memory) keeps
+                    # that schedule: it is what the kernel's block is made of.
+                    if isinstance(node, nodes.EntryNode) and node.schedule == dtypes.ScheduleType.GPU_ThreadBlock:
+                        continue
                     if isinstance(node, (nodes.EntryNode, nodes.LibraryNode)):
                         node.schedule = dtypes.ScheduleType.Sequential
                     elif isinstance(node, nodes.NestedSDFG):
@@ -453,7 +524,7 @@ class GPUTransformSDFG(transformation.MultiStateTransformation):
                         ):
                             nsdfgs.append((node, state))
                     elif isinstance(node, nodes.Tasklet):
-                        if node in global_code_nodes[state]:
+                        if node in global_code_nodes[state] or self._is_host_only_tasklet(state, node, device_data):
                             continue
                         if state.entry_node(node) is None and not scope.is_devicelevel_gpu_kernel(
                             state.parent, state, node
@@ -540,29 +611,41 @@ class GPUTransformSDFG(transformation.MultiStateTransformation):
 
         # Extend global_code_nodes with tasklets that write/read from an array
         # Previous steps map all arrays to GPU storage, but only checks tasklets that write to/read from
-        # Scalars to be wrapped in a GPU Map
-        for state in sdfg.states():
-            for node in state.nodes():
-                if isinstance(node, nodes.Tasklet):
-                    if node in global_code_nodes[state]:
-                        continue
-                    if state.entry_node(node) is None and not scope.is_devicelevel_gpu_kernel(
-                        state.parent, state, node
-                    ):
-                        memlet_path_roots = set()
-                        memlet_path_roots = memlet_path_roots.union(
-                            [state.memlet_tree(e).root().edge.src for e in state.in_edges(node)]
-                        )
-                        memlet_path_roots = memlet_path_roots.union(
-                            [state.memlet_tree(e).root().edge.dst for e in state.out_edges(node)]
-                        )
-                        gpu_accesses = [
-                            n.data
-                            for n in memlet_path_roots
-                            if isinstance(n, nodes.AccessNode) and sdfg.arrays[n.data].storage in gpu_storage
-                        ]
-                        if len(gpu_accesses) > 0:
-                            global_code_nodes[state].append(node)
+        # Scalars to be wrapped in a GPU Map. A tasklet wrapped here takes its scalar results to the device with it
+        # (a kernel cannot write host memory), and a tasklet reading such a result then follows: to a fixed point.
+        changed = True
+        while changed:
+            changed = False
+            for state in sdfg.states():
+                for node in state.nodes():
+                    if isinstance(node, nodes.Tasklet):
+                        if node in global_code_nodes[state]:
+                            continue
+                        if state.entry_node(node) is None and not scope.is_devicelevel_gpu_kernel(
+                            state.parent, state, node
+                        ):
+                            memlet_path_roots = set()
+                            memlet_path_roots = memlet_path_roots.union(
+                                [state.memlet_tree(e).root().edge.src for e in state.in_edges(node)]
+                            )
+                            memlet_path_roots = memlet_path_roots.union(
+                                [state.memlet_tree(e).root().edge.dst for e in state.out_edges(node)]
+                            )
+                            gpu_accesses = [
+                                n.data
+                                for n in memlet_path_roots
+                                if isinstance(n, nodes.AccessNode) and sdfg.arrays[n.data].storage in gpu_storage
+                            ]
+                            if len(gpu_accesses) > 0:
+                                global_code_nodes[state].append(node)
+                                changed = True
+                                for e in state.out_edges(node):
+                                    dst = state.memlet_path(e)[-1].dst
+                                    if not isinstance(dst, nodes.AccessNode):
+                                        continue
+                                    desc = sdfg.arrays[dst.data]
+                                    if isinstance(desc, data.Scalar) and desc.transient and desc.storage not in gpu_storage:
+                                        _move_to_gpu(dst.data)
 
         for state, gcodes in global_code_nodes.items():
             for gcode in gcodes:
@@ -575,18 +658,28 @@ class GPUTransformSDFG(transformation.MultiStateTransformation):
                 # Store in/out edges in lists so that they don't get corrupted when they are removed from the graph.
                 in_edges = list(state.in_edges(gcode))
                 out_edges = list(state.out_edges(gcode))
-                me.in_connectors = {("IN_" + e.dst_conn): None for e in in_edges}
-                me.out_connectors = {("OUT_" + e.dst_conn): None for e in in_edges}
-                mx.in_connectors = {("IN_" + e.src_conn): None for e in out_edges}
-                mx.out_connectors = {("OUT_" + e.src_conn): None for e in out_edges}
+                # Edges without a connector only order the tasklet (empty memlets): they pass through the map as
+                # empty edges and get no connectors of their own.
+                me.in_connectors = {("IN_" + e.dst_conn): None for e in in_edges if e.dst_conn is not None}
+                me.out_connectors = {("OUT_" + e.dst_conn): None for e in in_edges if e.dst_conn is not None}
+                mx.in_connectors = {("IN_" + e.src_conn): None for e in out_edges if e.src_conn is not None}
+                mx.out_connectors = {("OUT_" + e.src_conn): None for e in out_edges if e.src_conn is not None}
 
                 # Create memlets through map
                 for e in in_edges:
                     state.remove_edge(e)
+                    if e.dst_conn is None:
+                        state.add_nedge(e.src, me, dc(e.data))
+                        state.add_nedge(me, e.dst, dc(e.data))
+                        continue
                     state.add_edge(e.src, e.src_conn, me, "IN_" + e.dst_conn, e.data)
                     state.add_edge(me, "OUT_" + e.dst_conn, e.dst, e.dst_conn, dc(e.data))
                 for e in out_edges:
                     state.remove_edge(e)
+                    if e.src_conn is None:
+                        state.add_nedge(e.src, mx, dc(e.data))
+                        state.add_nedge(mx, e.dst, dc(e.data))
+                        continue
                     state.add_edge(e.src, e.src_conn, mx, "IN_" + e.src_conn, e.data)
                     state.add_edge(mx, "OUT_" + e.src_conn, e.dst, e.dst_conn, dc(e.data))
 
