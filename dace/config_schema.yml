@@ -409,6 +409,16 @@ required:
                             DaCe forwards ``compiler.cpu.args``, which hipcc takes directly.
                         default: ''
 
+                    split_files:
+                        type: int
+                        default: 1
+                        title: CUDA source files
+                        description: >
+                            The kernels spread over up to this many .cu files, which the build compiles in
+                            parallel; 1 is one file. Every file repeats the shared declarations and device
+                            functions, the first one holds the runtime's initialisation. The code of each
+                            kernel does not change.
+
                     cuda_arch:
                         type: str
                         title: CUDA architectures to compile for

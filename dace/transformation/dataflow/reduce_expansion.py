@@ -264,7 +264,6 @@ class ReduceExpansion(transformation.SingleStateTransformation):
         scope_tree = ScopeTree(outer_entry, outer_exit)
         scope_tree.parent = ScopeTree(None, None)
         propagate_memlets_scope(sdfg, graph, scope_tree)
-        sdfg.validate()
 
         # create variables for outside access
         self._reduce = reduce_node_new

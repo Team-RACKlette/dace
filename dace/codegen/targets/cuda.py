@@ -91,6 +91,25 @@ def cpu_to_gpu_cpred(sdfg, state, src_node, dst_node):
     return True
 
 
+def split_kernels(code: str, spans: List[Tuple[int, int]], files: int) -> List[str]:
+    """``code`` (the kernels and their launchers) as the text of up to ``files`` source files compiled in parallel:
+    whole kernels, the longest first into the shortest file so far; text outside the kernels stays in the first."""
+    if files <= 1 or len(spans) <= 1:
+        return [code]
+    spans = sorted(spans)
+    kernels = [code[start:end] for start, end in spans]
+    outside = "".join(code[prev_end:start] for (_, prev_end), (start, _) in zip([(0, 0), *spans], spans))
+    outside += code[spans[-1][1]:]
+    assignment = [0] * len(kernels)
+    lengths = [0] * min(files, len(kernels))
+    for i in sorted(range(len(kernels)), key=lambda i: -len(kernels[i])):
+        assignment[i] = lengths.index(min(lengths))
+        lengths[assignment[i]] += len(kernels[i])
+    texts = ["".join(k for k, f in zip(kernels, assignment) if f == file) for file in range(len(lengths))]
+    texts[0] = outside + texts[0]
+    return texts
+
+
 @registry.autoregister_params(name="cuda")
 class CUDACodeGen(TargetCodeGenerator):
     """GPU (CUDA/HIP) code generator."""
@@ -197,6 +216,7 @@ class CUDACodeGen(TargetCodeGenerator):
         self._codeobject = CodeObject(
             sdfg.name + "_" + "cuda", "", self.language, CUDACodeGen, "CUDA", target_type=target_type
         )
+        self._kernel_spans: List[Tuple[int, int]] = []  # each kernel's text in self._localcode: start and end
 
         # TODO: Below implementation is a bit wasteful to iterate over all nodes.
         # Better: Do this in a dedicated pass and do not e.g. recurse further into
@@ -464,7 +484,7 @@ class CUDACodeGen(TargetCodeGenerator):
     DACE_GPU_CHECK({backend}MemPoolSetAttribute(mempool, {backend}MemPoolAttrReleaseThreshold, &threshold));
 """.format(backend=self.backend, poolcfg_threshold=("UINT64_MAX" if poolcfg == -1 else poolcfg))
 
-        self._codeobject.code = """
+        common = """
 #include <{backend_header}>
 #include <dace/dace.h>
 
@@ -478,7 +498,8 @@ DACE_EXPORTED bool __dace_gpu_set_stream({sdfg_state_name} *__state, int streami
 DACE_EXPORTED void __dace_gpu_set_all_streams({sdfg_state_name} *__state, gpuStream_t stream);
 
 {other_globalcode}
-
+"""
+        runtime = """
 int __dace_init_cuda({sdfg_state_name} *__state{params}) {{
     int count;
 
@@ -588,15 +609,13 @@ void __dace_gpu_set_all_streams({sdfg_state_name} *__state, gpuStream_t stream)
     for (int i = 0; i < {nstreams}; ++i)
         __state->gpu_context->streams[i] = stream;
 }}
-
-{localcode}
-""".format(
+"""
+        values = dict(
             params=params_comma,
             sdfg_state_name=mangle_dace_state_struct_name(self._global_sdfg),
             initcode=initcode.getvalue(),
             exitcode=exitcode.getvalue(),
             other_globalcode=self._globalcode.getvalue(),
-            localcode=self._localcode.getvalue(),
             file_header=fileheader.getvalue(),
             nstreams=max(1, self._cuda_streams),
             nevents=max(1, self._cuda_events),
@@ -605,8 +624,16 @@ void __dace_gpu_set_all_streams({sdfg_state_name} *__state, gpuStream_t stream)
             pool_header=pool_header,
             sdfg=self._global_sdfg,
         )
-
-        return [self._codeobject]
+        common, runtime = common.format(**values), runtime.format(**values)
+        files = split_kernels(self._localcode.getvalue(), self._kernel_spans,
+                              Config.get("compiler", "cuda", "split_files"))
+        self._codeobject.code = common + runtime + files[0]
+        others = [
+            CodeObject(f"{self._codeobject.name}_{i}", common + code, self.language, CUDACodeGen, "CUDA",
+                       target_type=self._codeobject.target_type)
+            for i, code in enumerate(files[1:], 1)
+        ]
+        return [self._codeobject, *others]
 
     def node_dispatch_predicate(self, sdfg, state, node):
         # NOTE: Works on nodes and scopes
@@ -2234,6 +2261,7 @@ void __dace_alloc_{location}(uint32_t {size}, dace::GPUStream<{type}, {is_pow2}>
             launch_bounds = ""
 
         # Write kernel prototype
+        kernel_start = self._localcode.tell()
         self._localcode.write(
             "__global__ void %s %s %s(%s) {\n"
             % (maxnreg_str, launch_bounds, kernel_name, ", ".join(kernel_args_typed + extra_kernel_args_typed)),
@@ -2395,6 +2423,7 @@ gpuError_t __err = {backend}LaunchKernel((void*){kname}, dim3({gdims}), dim3({bd
 
         # Close the runkernel function
         self._localcode.write("}")
+        self._kernel_spans.append((kernel_start, self._localcode.tell()))
         #######################
         # Add invocation to calling code (in another file)
         function_stream.write(

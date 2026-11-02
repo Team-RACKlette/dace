@@ -47,9 +47,9 @@ class DaCeCodeGenerator(object):
             Union[SDFG, SDFGState, nodes.EntryNode],
             List[Tuple[SDFG, Optional[SDFGState], Optional[nodes.AccessNode], bool, bool, bool]],
         ] = collections.defaultdict(list)
-        self.where_allocated: Dict[Tuple[SDFG, str], SDFG] = {}
-        self.fsyms: Dict[int, Set[str]] = {}
-        self._symbols_and_constants: Dict[int, Set[str]] = {}
+        self.where_allocated: dict[tuple[SDFG, str], SDFG] = {}
+        self.fsyms: dict[tuple[int, bool], set[str]] = {}
+        self._symbols_and_constants: dict[int, set[str]] = {}
         # The symbols visible in each state, shared by all nodes of the state (filled during code generation)
         self._symbol_resolver = SymbolResolver()
         self._struct_types: Dict[SDFG, Dict[str, dtypes.struct]] = {}
@@ -91,11 +91,14 @@ class DaCeCodeGenerator(object):
     def symbols_and_constants(self, sdfg: SDFG):
         return self._symbols_and_constants[sdfg.cfg_id]
 
-    def free_symbols(self, obj: Any):
-        k = id(obj)
+    def free_symbols(self, obj: Any, keep_defined_in_mapping: bool = False):
+        k = (id(obj), keep_defined_in_mapping)
         if k in self.fsyms:
             return self.fsyms[k]
-        if hasattr(obj, "used_symbols"):
+        if keep_defined_in_mapping:
+            # The symbols a nested SDFG's header and call pass; interstate edges do not take the flag
+            result = obj.used_symbols(all_symbols=False, keep_defined_in_mapping=True)
+        elif hasattr(obj, "used_symbols"):
             result = obj.used_symbols(all_symbols=False)
         else:
             result = obj.free_symbols

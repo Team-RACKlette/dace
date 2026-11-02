@@ -27,6 +27,15 @@ if TYPE_CHECKING:
     from dace.sdfg.state import SDFGState, SymbolResolver
 
 
+def _defined_names(variable_context) -> frozenset:
+    """The names of the defined variables of a propagation context. :func:`propagate_subset` computes them once per
+    subset and passes them as the context's first element; a context without them (another caller's) is stringified
+    here, as before."""
+    if len(variable_context) == 3:
+        return variable_context[0]
+    return frozenset(map(str, variable_context[-2]))
+
+
 @registry.make_registry
 class MemletPattern(object):
     """
@@ -244,7 +253,9 @@ class AffineSMemlet(SeparableMemletPattern):
                     # exactly are not supported by this pattern.
                     return False
             # By name: symbols compare by dtype too, and the range may type them differently
-            if not {str(s) for s in node_rb.free_symbols | node_re.free_symbols}.issubset(map(str, defined_vars)):
+            if not {str(s) for s in node_rb.free_symbols | node_re.free_symbols}.issubset(
+                _defined_names(variable_context)
+            ):
                 # Cannot propagate variables only defined in this scope (e.g.,
                 # dynamic map ranges)
                 return False
@@ -469,7 +480,7 @@ class GenericSMemlet(SeparableMemletPattern):
         # By name: symbols compare by dtype too, and the memlet, range and context may type them differently
         used_names = set(map(str, used_symbols))
         if not used_names.isdisjoint(map(str, self.params)) and not set(map(str, node_range.free_symbols)).issubset(
-            map(str, defined_vars)
+            _defined_names(variable_context)
         ):
             # Cannot propagate symbols that are undefined in the outer range
             # (e.g., dynamic map ranges).
@@ -1910,9 +1921,11 @@ def propagate_subset(
     if undefined_names:
         defined_variables = {v for v in defined_variables if str(v) not in undefined_names}
 
-    # Propagate subset
+    # Propagate subset. The patterns compare symbols by name: the names once here, not per memlet and dimension
+    # (SymPy's printing was most of a large SDFG's propagation time).
+    defined_names = frozenset(map(str, defined_variables))
     param_symbols = [symbolic.pystr_to_symbolic(p) for p in params]
-    variable_context = [defined_variables, param_symbols]
+    variable_context = [defined_names, defined_variables, param_symbols]
 
     new_subset = None
     for md in memlets:
@@ -1996,7 +2009,7 @@ def propagate_subset(
     if any(m.dynamic for m in memlets):
         new_memlet.dynamic = True
     if symbolic.issymbolic(new_memlet.volume) and not set(map(str, new_memlet.volume.free_symbols)).issubset(
-        map(str, defined_variables)
+        defined_names
     ):
         new_memlet.dynamic = True
         new_memlet.volume = 0
